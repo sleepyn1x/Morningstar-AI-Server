@@ -1517,7 +1517,7 @@ def run_ai_job(job_id: str, messages: list, session: dict, user_text: str, api_k
     ai_reply, used_model, was_fallback, attempts_log = run_model_cascade(messages, api_key)
 
     if not ai_reply:
-        ai_reply = "🔴 Все модели недоступны (вероятно, дневной лимит OpenRouter исчерпан). Пополните баланс или подождите."
+        ai_reply = "🔴 All models are unavailable (OpenRouter's daily limit has likely been reached). Alternatively, check your OpenRouter KEY. Top up your balance or wait."
         used_model = None
 
     with sessions_lock:
