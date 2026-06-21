@@ -1252,6 +1252,12 @@ def get_session(sid: str) -> dict:
         return sessions[sid]
 
 
+def is_job_cancelled(job_id: str) -> bool:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return job and job.get("cancelled", False)
+
+
 def cleanup_old_jobs():
     now = time.time()
     with jobs_lock:
@@ -1321,22 +1327,20 @@ def call_openrouter(messages: list, model: str, api_key: str, max_tokens: int = 
     raise Exception(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
 
-def run_model_cascade(messages: list, api_key: str):
+def run_model_cascade(messages: list, api_key: str, job_id: str = None):
     """
     Walks AI_MODELS_CASCADE, skipping models currently in cooldown.
     On a 429, retries the SAME model once after a short pause before
     giving up on it and moving down the cascade (cooldown applied).
-    On a truncated reply (finish_reason == 'length'), automatically
-    asks the same model to continue, up to MAX_CONTINUATIONS times.
-
-    Returns (full_reply_text, used_model, was_fallback, attempts_log)
-    attempts_log is a list of {"model": ..., "outcome": ...} for transparency —
-    this is what lets you SEE when you've silently dropped to a weaker model.
     """
     first_choice = AI_MODELS_CASCADE[0]
     attempts_log = []
 
     for model in AI_MODELS_CASCADE:
+        if job_id and is_job_cancelled(job_id):
+            attempts_log.append({"model": "system", "outcome": "cancelled_by_user"})
+            return None, None, True, attempts_log
+
         if is_model_cooling_down(model):
             attempts_log.append({"model": model, "outcome": "skipped_cooldown"})
             continue
@@ -1349,6 +1353,9 @@ def run_model_cascade(messages: list, api_key: str):
                 continuations = 0
                 full_content = content
                 while finish_reason == "length" and continuations < MAX_CONTINUATIONS:
+                    if job_id and is_job_cancelled(job_id):
+                        break # Прерываем авто-продолжение
+
                     continuations += 1
                     follow_up = messages + [
                         {"role": "assistant", "content": full_content},
@@ -1366,7 +1373,11 @@ def run_model_cascade(messages: list, api_key: str):
 
             except RateLimitedError:
                 if attempt == 1:
-                    time.sleep(2)  # brief backoff, try the SAME model once more
+                    # Прерываемая пауза 4 секунды (429 ошибка требует чуть больше времени)
+                    for _ in range(4):
+                        if job_id and is_job_cancelled(job_id): 
+                            return None, None, True, attempts_log
+                        time.sleep(1)
                     continue
                 record_stat(model, "rate_limited")
                 attempts_log.append({"model": model, "outcome": "rate_limited"})
@@ -1514,7 +1525,13 @@ def attempt_repair(messages: list, original_reply: str, original_code: str,
 # ASYNC JOB RUNNER (background thread)
 # ──────────────────────────────────────────────────────────────
 def run_ai_job(job_id: str, messages: list, session: dict, user_text: str, api_key: str):
-    ai_reply, used_model, was_fallback, attempts_log = run_model_cascade(messages, api_key)
+    if is_job_cancelled(job_id): return
+
+    ai_reply, used_model, was_fallback, attempts_log = run_model_cascade(messages, api_key, job_id)
+
+    if is_job_cancelled(job_id):
+        print(f"  🛑 [{job_id}] Cancelled by user during execution.")
+        return
 
     if not ai_reply:
         ai_reply = "🔴 All models are unavailable (OpenRouter's daily limit has likely been reached). Alternatively, check your OpenRouter KEY. Top up your balance or wait."
@@ -1627,6 +1644,22 @@ def get_result(job_id):
     if not job:
         return jsonify({"status": "not_found"}), 404
     return jsonify({"status": job["status"], "result": job.get("result")})
+
+
+@app.route("/cancel", methods=["POST"])
+def cancel_job():
+    data = request.json or {}
+    job_id = data.get("job_id")
+    if not job_id:
+        return jsonify({"error": "No job_id provided"}), 400
+
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["cancelled"] = True
+            jobs[job_id]["status"] = "cancelled"
+            print(f"  🛑 [{job_id}] Marked as cancelled via API.")
+            return jsonify({"status": "cancelled"})
+    return jsonify({"status": "not_found"}), 404
 
 
 @app.route("/clear_history", methods=["POST"])
